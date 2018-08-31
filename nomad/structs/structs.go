@@ -24,6 +24,9 @@ import (
 
 	"golang.org/x/crypto/blake2b"
 
+	"container/heap"
+	"math"
+
 	"github.com/gorhill/cronexpr"
 	"github.com/hashicorp/consul/api"
 	multierror "github.com/hashicorp/go-multierror"
@@ -32,10 +35,9 @@ import (
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/args"
 	"github.com/hashicorp/nomad/helper/uuid"
+	"github.com/hashicorp/nomad/lib/kheap"
 	"github.com/mitchellh/copystructure"
 	"github.com/ugorji/go/codec"
-
-	"math"
 
 	hcodec "github.com/hashicorp/go-msgpack/codec"
 )
@@ -133,6 +135,13 @@ const (
 	// MaxRetainedNodeEvents is the maximum number of node events that will be
 	// retained for a single node
 	MaxRetainedNodeEvents = 10
+
+	// MaxRetainedNodeScores is the number of top scoring nodes for which we
+	// retain scoring metadata
+	MaxRetainedNodeScores = 5
+
+	// Normalized scorer name
+	NormScorerName = "normalized-score"
 )
 
 // Context defines the scope in which a search for Nomad object operates, and
@@ -6489,7 +6498,19 @@ type AllocMetric struct {
 
 	// Scores is the scores of the final few nodes remaining
 	// for placement. The top score is typically selected.
+	// Deprecated: Replaced by ScoreMetaData in Nomad 0.9
 	Scores map[string]float64
+
+	// ScoreMetaData is a slice of top scoring nodes displayed in the CLI
+	ScoreMetaData []*NodeScoreMeta
+
+	// nodeScoreMeta is used to keep scores for a single node id. It is cleared out after
+	// we receive normalized score during the last step of the scoring stack.
+	nodeScoreMeta *NodeScoreMeta
+
+	// topScores is used to maintain a heap of the top K nodes with
+	// the highest normalized score
+	topScores *kheap.ScoreHeap
 
 	// AllocationTime is a measure of how long the allocation
 	// attempt took. This can affect performance and SLAs.
@@ -6515,6 +6536,7 @@ func (a *AllocMetric) Copy() *AllocMetric {
 	na.DimensionExhausted = helper.CopyMapStringInt(na.DimensionExhausted)
 	na.QuotaExhausted = helper.CopySliceString(na.QuotaExhausted)
 	na.Scores = helper.CopyMapStringFloat64(na.Scores)
+	na.ScoreMetaData = CopySliceNodeScoreMeta(na.ScoreMetaData)
 	return na
 }
 
@@ -6562,12 +6584,77 @@ func (a *AllocMetric) ExhaustQuota(dimensions []string) {
 	a.QuotaExhausted = append(a.QuotaExhausted, dimensions...)
 }
 
+// ScoreNode is used to gather top K scoring nodes in a heap
 func (a *AllocMetric) ScoreNode(node *Node, name string, score float64) {
-	if a.Scores == nil {
-		a.Scores = make(map[string]float64)
+	// Create nodeScoreMeta lazily if its the first time or if its a new node
+	if a.nodeScoreMeta == nil || a.nodeScoreMeta.NodeID != node.ID {
+		a.nodeScoreMeta = &NodeScoreMeta{
+			NodeID: node.ID,
+			Scores: make(map[string]float64),
+		}
 	}
-	key := fmt.Sprintf("%s.%s", node.ID, name)
-	a.Scores[key] = score
+	if name == NormScorerName {
+		a.nodeScoreMeta.NormScore = score
+		// Once we have the normalized score we can push to the heap
+		// that tracks top K by normalized score
+
+		// Create the heap if its not there already
+		if a.topScores == nil {
+			a.topScores = kheap.NewScoreHeap(MaxRetainedNodeScores)
+		}
+		heap.Push(a.topScores, a.nodeScoreMeta)
+
+		// Clear out this entry because its now in the heap
+		a.nodeScoreMeta = nil
+	} else {
+		a.nodeScoreMeta.Scores[name] = score
+	}
+}
+
+// PopulateScoreMetaData populates a map of scorer to scoring metadata
+// The map is populated by popping elements from a heap of top K scores
+// maintained per scorer
+func (a *AllocMetric) PopulateScoreMetaData() {
+	if a.topScores == nil {
+		return
+	}
+
+	if a.ScoreMetaData == nil {
+		a.ScoreMetaData = make([]*NodeScoreMeta, a.topScores.Len())
+	}
+	heapItems := a.topScores.GetItemsReverse()
+	for i, item := range heapItems {
+		a.ScoreMetaData[i] = item.(*NodeScoreMeta)
+	}
+}
+
+// NodeScoreMeta captures scoring meta data derived from
+// different scoring factors.
+type NodeScoreMeta struct {
+	NodeID    string
+	Scores    map[string]float64
+	NormScore float64
+}
+
+func (s *NodeScoreMeta) Copy() *NodeScoreMeta {
+	if s == nil {
+		return nil
+	}
+	ns := new(NodeScoreMeta)
+	*ns = *s
+	return ns
+}
+
+func (s *NodeScoreMeta) String() string {
+	return fmt.Sprintf("%s %f %v", s.NodeID, s.NormScore, s.Scores)
+}
+
+func (s *NodeScoreMeta) Score() float64 {
+	return s.NormScore
+}
+
+func (s *NodeScoreMeta) Data() interface{} {
+	return s
 }
 
 // AllocDeploymentStatus captures the status of the allocation as part of the
