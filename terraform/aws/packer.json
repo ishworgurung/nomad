@@ -1,11 +1,11 @@
 {
   "builders": [{
     "type": "amazon-ebs",
-    "region": "us-east-1",
-    "source_ami": "ami-80861296",
+    "region": "ap-southeast-2",
+    "source_ami": "ami-059b78064586da1b7",
     "instance_type": "t2.medium",
     "ssh_username": "ubuntu",
-    "ami_name": "hashistack {{timestamp}}",
+    "ami_name": "nomad {{timestamp}}",
     "ami_groups": ["all"]
   }],
   "provisioners":  [
